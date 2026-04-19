@@ -1,337 +1,189 @@
+# =============================================================================
+#  main.py  —  Discord Bot + Flask uptime server (Render-ready)
+#  Autor: refatorado por Antigravity (Senior Python / Infra)
+# =============================================================================
+
 import io
+import os
 import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 from flask import Flask
 
-from config import DISCORD_TOKEN
+# =============================================================================
+#  CONFIGURAÇÃO  —  variáveis de ambiente (sem config.py)
+# =============================================================================
+DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
+OWNER_ID: int = int(os.getenv("OWNER_ID", "0"))
+DATABASE_PATH: Path = Path("database.db")
 
-# ---------------------------------------------------------------------------
-# Servidor Flask — necessário para hospedar na Render (health-check HTTP)
-# ---------------------------------------------------------------------------
-app_flask = Flask(__name__)
+if not DISCORD_TOKEN:
+    raise RuntimeError("A variável de ambiente DISCORD_TOKEN não está definida.")
+if not OWNER_ID:
+    raise RuntimeError("A variável de ambiente OWNER_ID não está definida.")
 
 
-@app_flask.route("/")
-def health_check():
+# =============================================================================
+#  SERVIDOR FLASK  —  mantém o serviço ativo na Render (porta 10000)
+# =============================================================================
+_flask_app = Flask(__name__)
+
+
+@_flask_app.route("/")
+def _health() -> tuple[str, int]:
     return "OK", 200
 
 
-def run_flask() -> None:
-    """Inicia o Flask na porta 8080 (blocking). Deve ser chamado em uma thread separada."""
-    app_flask.run(host="0.0.0.0", port=8080)
-# ---------------------------------------------------------------------------
-
-# Substitua pelo seu ID de usuário no Discord
-OWNER_ID = 1494514417734254592
-DATABASE_PATH = Path("database.db")
+def _run_flask() -> None:
+    """Inicia o Flask em modo silencioso numa thread bloqueante."""
+    import logging
+    log = logging.getLogger("werkzeug")
+    log.setLevel(logging.ERROR)          # suprime logs verbosos do Flask
+    _flask_app.run(host="0.0.0.0", port=10000)
 
 
-def init_database() -> None:
+# =============================================================================
+#  BANCO DE DADOS  —  SQLite  (tabela: arquivos)
+# =============================================================================
+
+def init_db() -> None:
     with sqlite3.connect(DATABASE_PATH) as conn:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS produtos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL,
-                conteudo_codigo TEXT NOT NULL,
-                data_hora TEXT
+            CREATE TABLE IF NOT EXISTS arquivos (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome         TEXT    NOT NULL,
+                conteudo     TEXT    NOT NULL,
+                data_criacao TEXT    NOT NULL
             )
             """
         )
-        columns = [row[1] for row in conn.execute("PRAGMA table_info(produtos)").fetchall()]
-        if "data_hora" not in columns:
-            conn.execute("ALTER TABLE produtos ADD COLUMN data_hora TEXT")
         conn.commit()
 
 
-def add_produto(nome: str, conteudo_codigo: str) -> None:
-    data_hora = datetime.now().strftime("%d/%m/%Y %H:%M")
+def db_insert(nome: str, conteudo: str) -> None:
+    data_criacao = datetime.now().strftime("%d/%m/%Y %H:%M")
     with sqlite3.connect(DATABASE_PATH) as conn:
         conn.execute(
-            "INSERT INTO produtos (nome, conteudo_codigo, data_hora) VALUES (?, ?, ?)",
-            (nome, conteudo_codigo, data_hora),
+            "INSERT INTO arquivos (nome, conteudo, data_criacao) VALUES (?, ?, ?)",
+            (nome, conteudo, data_criacao),
         )
         conn.commit()
 
 
-def get_all_produtos() -> list[tuple[int, str, str, str | None]]:
+def db_all() -> list[tuple[int, str, str, str]]:
     with sqlite3.connect(DATABASE_PATH) as conn:
-        cursor = conn.execute(
-            "SELECT id, nome, conteudo_codigo, data_hora FROM produtos ORDER BY id DESC"
-        )
-        return cursor.fetchall()
+        return conn.execute(
+            "SELECT id, nome, conteudo, data_criacao FROM arquivos ORDER BY id DESC"
+        ).fetchall()
 
 
-def get_produto_by_id(produto_id: int) -> tuple[int, str, str, str | None] | None:
+def db_get(arquivo_id: int) -> tuple[int, str, str, str] | None:
     with sqlite3.connect(DATABASE_PATH) as conn:
-        cursor = conn.execute(
-            "SELECT id, nome, conteudo_codigo, data_hora FROM produtos WHERE id = ?",
-            (produto_id,),
-        )
-        return cursor.fetchone()
+        return conn.execute(
+            "SELECT id, nome, conteudo, data_criacao FROM arquivos WHERE id = ?",
+            (arquivo_id,),
+        ).fetchone()
 
 
-def update_produto(produto_id: int, nome: str, conteudo_codigo: str) -> bool:
-    """Atualiza nome, conteúdo e redefine data_hora para o momento da edição."""
-    data_hora = datetime.now().strftime("%d/%m/%Y %H:%M")
+def db_delete(arquivo_id: int) -> bool:
     with sqlite3.connect(DATABASE_PATH) as conn:
-        cur = conn.execute(
-            "UPDATE produtos SET nome = ?, conteudo_codigo = ?, data_hora = ? WHERE id = ?",
-            (nome, conteudo_codigo, data_hora, produto_id),
-        )
+        cur = conn.execute("DELETE FROM arquivos WHERE id = ?", (arquivo_id,))
         conn.commit()
         return cur.rowcount > 0
 
 
-def delete_produto(produto_id: int) -> bool:
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        cur = conn.execute("DELETE FROM produtos WHERE id = ?", (produto_id,))
-        conn.commit()
-        return cur.rowcount > 0
+# =============================================================================
+#  HELPERS
+# =============================================================================
+DARK = 0x2B2D31   # cor dark-mode para todos os embeds
 
 
-def is_owner(user_id: int) -> bool:
+def _safe_filename(name: str) -> str:
+    clean = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    return (clean.strip("_") or "arquivo")[:80]
+
+
+def _is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
 
-def sanitize_filename(name: str) -> str:
-    cleaned = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in name)
-    cleaned = cleaned.strip("_")
-    return cleaned[:80] or "arquivo"
+# =============================================================================
+#  MODAIS
+# =============================================================================
 
-
-class AddProdutoModal(discord.ui.Modal, title="Adicionar Novo Produto"):
-    nome_produto = discord.ui.TextInput(
-        label="Nome do Produto",
-        placeholder="Ex: Pacote Premium v1",
+class CadastrarArquivoModal(discord.ui.Modal, title="Cadastrar Arquivo"):
+    nome = discord.ui.TextInput(
+        label="Nome do Arquivo",
+        placeholder="Ex: Hack Premium v3",
         max_length=100,
     )
-    codigo_script = discord.ui.TextInput(
-        label="Código/Script",
+    conteudo = discord.ui.TextInput(
+        label="Código / Conteúdo do Arquivo",
         style=discord.TextStyle.paragraph,
-        placeholder="Cole o conteúdo do arquivo...",
+        placeholder="Cole aqui o texto ou código...",
         max_length=4000,
     )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not is_owner(interaction.user.id):
+        if not _is_owner(interaction.user.id):
             await interaction.response.send_message(
-                "❌ Acesso negado. Apenas o administrador pode cadastrar conteúdo.",
-                ephemeral=True,
+                "❌ Acesso negado.", ephemeral=True
             )
             return
 
-        add_produto(str(self.nome_produto), str(self.codigo_script))
-        await interaction.response.send_message(
-            "✅ Produto cadastrado com sucesso.\n"
-            "💡 **Dica:** reenvie `/enviar_painel` no canal público para o menu refletir novos itens.",
-            ephemeral=True,
+        db_insert(str(self.nome), str(self.conteudo))
+
+        embed = discord.Embed(
+            title="✅ Arquivo Cadastrado",
+            description=(
+                f"**Nome:** `{self.nome}`\n"
+                "Use `/enviar_painel` no canal público para atualizar o menu."
+            ),
+            color=DARK,
         )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         await interaction.response.send_message(
-            f"❌ Erro ao salvar produto: {error}",
-            ephemeral=True,
+            f"❌ Erro interno: `{error}`", ephemeral=True
         )
 
 
-class EditProdutoModal(discord.ui.Modal):
-    def __init__(self, produto_id: int, nome_atual: str, conteudo_atual: str) -> None:
-        super().__init__(title=f"Editar produto #{produto_id}")
-        self.produto_id = produto_id
+# =============================================================================
+#  SELECT PERSISTENTE  —  painel público
+# =============================================================================
 
-        nome_default = nome_atual[:100]
-        if len(conteudo_atual) <= 4000:
-            conteudo_default = conteudo_atual
-        else:
-            conteudo_default = conteudo_atual[:3997] + "..."
-
-        self.nome_produto = discord.ui.TextInput(
-            label="Nome do Produto",
-            default=nome_default,
-            max_length=100,
-        )
-        self.codigo_script = discord.ui.TextInput(
-            label="Código/Script",
-            style=discord.TextStyle.paragraph,
-            default=conteudo_default,
-            max_length=4000,
-        )
-        self.add_item(self.nome_produto)
-        self.add_item(self.codigo_script)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not is_owner(interaction.user.id):
-            await interaction.response.send_message(
-                "❌ Acesso negado.",
-                ephemeral=True,
-            )
-            return
-
-        ok = update_produto(
-            self.produto_id,
-            str(self.nome_produto),
-            str(self.codigo_script),
-        )
-        if ok:
-            await interaction.response.send_message(
-                "✅ Produto atualizado.\n"
-                "💡 Reenvie `/enviar_painel` no canal público para atualizar o menu fixo.",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                "❌ Produto não encontrado (pode ter sido excluído).",
-                ephemeral=True,
-            )
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        await interaction.response.send_message(
-            f"❌ Erro ao editar: {error}",
-            ephemeral=True,
-        )
-
-
-class AdminEditarSelect(discord.ui.Select):
+class ArquivoSelect(discord.ui.Select):
     def __init__(self) -> None:
-        produtos = get_all_produtos()[:25]
+        arquivos = db_all()
         options: list[discord.SelectOption] = []
-        for pid, nome, _, dh in produtos:
-            options.append(
-                discord.SelectOption(
-                    label=f"#{pid} {nome[:80]}",
-                    description=(dh or "sem data")[:100],
-                    value=str(pid),
-                )
-            )
-        if not options:
-            options = [
-                discord.SelectOption(
-                    label="Nenhum produto cadastrado",
-                    value="none",
-                    description="Cadastre um item antes.",
-                )
-            ]
-        super().__init__(
-            placeholder="Escolha o produto para editar...",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
 
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if not is_owner(interaction.user.id):
-            await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
-            return
-        if self.values[0] == "none":
-            await interaction.response.send_message(
-                "ℹ️ Não há produtos para editar.",
-                ephemeral=True,
-            )
-            return
-        pid = int(self.values[0])
-        row = get_produto_by_id(pid)
-        if not row:
-            await interaction.response.send_message(
-                "❌ Produto não encontrado.",
-                ephemeral=True,
-            )
-            return
-        _, nome, conteudo, _ = row
-        await interaction.response.send_modal(EditProdutoModal(pid, nome, conteudo))
-
-
-class AdminExcluirSelect(discord.ui.Select):
-    def __init__(self) -> None:
-        produtos = get_all_produtos()[:25]
-        options: list[discord.SelectOption] = []
-        for pid, nome, _, dh in produtos:
-            options.append(
-                discord.SelectOption(
-                    label=f"#{pid} {nome[:80]}",
-                    description=(dh or "sem data")[:100],
-                    value=str(pid),
-                )
-            )
-        if not options:
-            options = [
-                discord.SelectOption(
-                    label="Nenhum produto cadastrado",
-                    value="none",
-                    description="Nada para excluir.",
-                )
-            ]
-        super().__init__(
-            placeholder="Escolha o produto para excluir...",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if not is_owner(interaction.user.id):
-            await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
-            return
-        if self.values[0] == "none":
-            await interaction.response.send_message(
-                "ℹ️ Não há produtos para excluir.",
-                ephemeral=True,
-            )
-            return
-        pid = int(self.values[0])
-        row = get_produto_by_id(pid)
-        if not row:
-            await interaction.response.send_message(
-                "❌ Produto não encontrado.",
-                ephemeral=True,
-            )
-            return
-        nome = row[1]
-        if delete_produto(pid):
-            await interaction.response.send_message(
-                f"✅ Produto **#{pid} — {nome[:80]}** excluído.\n"
-                "💡 Reenvie `/enviar_painel` no canal público para atualizar o menu fixo.",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                "❌ Não foi possível excluir.",
-                ephemeral=True,
-            )
-
-
-class ProdutoSelect(discord.ui.Select):
-    def __init__(self) -> None:
-        produtos = get_all_produtos()
-        options: list[discord.SelectOption] = []
-        for produto_id, nome, _, data_hora in produtos[:25]:
-            descricao = f"Cadastrado em: {data_hora}" if data_hora else "Sem data registrada"
+        for arq_id, nome, _, data_criacao in arquivos[:25]:
             options.append(
                 discord.SelectOption(
                     label=nome[:100],
-                    description=descricao[:100],
-                    value=str(produto_id),
+                    description=f"Cadastrado em: {data_criacao}"[:100],
+                    value=str(arq_id),
                 )
             )
 
         if not options:
             options = [
                 discord.SelectOption(
-                    label="Nenhum produto disponível",
+                    label="Nenhum arquivo disponível",
                     description="Aguarde o administrador cadastrar conteúdos.",
                     value="none",
                 )
             ]
 
         super().__init__(
-            custom_id="persistent_produto_select",
-            placeholder="Escolha o arquivo para resgatar...",
+            custom_id="persistent_arquivo_select",
+            placeholder="📂  Escolha o arquivo para receber na DM...",
             min_values=1,
             max_values=1,
             options=options,
@@ -340,32 +192,30 @@ class ProdutoSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction) -> None:
         if self.values[0] == "none":
             await interaction.response.send_message(
-                "ℹ️ Ainda não há arquivos cadastrados.",
-                ephemeral=True,
+                "ℹ️ Nenhum arquivo cadastrado ainda.", ephemeral=True
             )
             return
 
-        produto_id = int(self.values[0])
-        produto = get_produto_by_id(produto_id)
-        if not produto:
+        arq = db_get(int(self.values[0]))
+        if not arq:
             await interaction.response.send_message(
-                "❌ Arquivo não encontrado. Tente novamente.",
-                ephemeral=True,
+                "❌ Arquivo não encontrado (pode ter sido removido).", ephemeral=True
             )
             return
 
-        _, nome, conteudo_codigo, data_hora = produto
-        arquivo_memoria = io.BytesIO(conteudo_codigo.encode("utf-8"))
-        arquivo = discord.File(arquivo_memoria, filename=f"{sanitize_filename(nome)}.txt")
+        _, nome, conteudo, data_criacao = arq
+        buf = io.BytesIO(conteudo.encode("utf-8"))
+        arquivo = discord.File(buf, filename=f"{_safe_filename(nome)}.txt")
 
         try:
             await interaction.user.send(
-                f"Aqui está seu arquivo. Cadastrado em: {data_hora or 'Data não registrada'}",
+                content=f"📄 Aqui está seu arquivo — cadastrado em **{data_criacao}**.",
                 file=arquivo,
             )
         except discord.Forbidden:
             await interaction.response.send_message(
-                "❌ Não consegui te enviar o arquivo. Por favor, ative suas Mensagens Diretas nas configurações de privacidade do servidor e tente novamente!",
+                "❌ Não consigo te enviar o arquivo via DM.\n"
+                "Ative **Mensagens Diretas** nas configurações de privacidade do servidor e tente novamente.",
                 ephemeral=True,
             )
             return
@@ -377,249 +227,152 @@ class ProdutoSelect(discord.ui.Select):
             return
 
         await interaction.response.send_message(
-            "✅ Arquivo enviado no seu privado com segurança!",
-            ephemeral=True,
+            "✅ Arquivo enviado na sua DM com segurança!", ephemeral=True
         )
 
 
-class PersistentDropdownView(discord.ui.View):
+class PainelView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
-        self.add_item(ProdutoSelect())
+        self.add_item(ArquivoSelect())
 
 
-class AdminControlView(discord.ui.View):
-    def __init__(self) -> None:
-        super().__init__(timeout=600)
-
-    @discord.ui.button(
-        label="➕ Cadastrar",
-        style=discord.ButtonStyle.primary,
-        custom_id="admin_cadastrar_novo_conteudo",
-        row=0,
-    )
-    async def cadastrar(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not is_owner(interaction.user.id):
-            await interaction.response.send_message(
-                "❌ Acesso negado. Comando restrito ao administrador.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.send_modal(AddProdutoModal())
-
-    @discord.ui.button(
-        label="✏️ Editar",
-        style=discord.ButtonStyle.secondary,
-        custom_id="admin_editar_conteudo",
-        row=0,
-    )
-    async def editar(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not is_owner(interaction.user.id):
-            await interaction.response.send_message(
-                "❌ Acesso negado.",
-                ephemeral=True,
-            )
-            return
-        view = discord.ui.View(timeout=300)
-        view.add_item(AdminEditarSelect())
-        await interaction.response.send_message(
-            "Selecione abaixo o produto que deseja **editar**:",
-            view=view,
-            ephemeral=True,
-        )
-
-    @discord.ui.button(
-        label="🗑️ Excluir",
-        style=discord.ButtonStyle.danger,
-        custom_id="admin_excluir_conteudo",
-        row=0,
-    )
-    async def excluir(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not is_owner(interaction.user.id):
-            await interaction.response.send_message(
-                "❌ Acesso negado.",
-                ephemeral=True,
-            )
-            return
-        view = discord.ui.View(timeout=300)
-        view.add_item(AdminExcluirSelect())
-        await interaction.response.send_message(
-            "Selecione abaixo o produto que deseja **excluir** (ação imediata):",
-            view=view,
-            ephemeral=True,
-        )
-
-    @discord.ui.button(
-        label="📋 Listar",
-        style=discord.ButtonStyle.secondary,
-        custom_id="admin_listar_conteudos",
-        row=1,
-    )
-    async def listar(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not is_owner(interaction.user.id):
-            await interaction.response.send_message(
-                "❌ Acesso negado.",
-                ephemeral=True,
-            )
-            return
-        produtos = get_all_produtos()
-        if not produtos:
-            await interaction.response.send_message(
-                "ℹ️ Nenhum produto cadastrado.",
-                ephemeral=True,
-            )
-            return
-        linhas = []
-        for pid, nome, _, dh in produtos:
-            linhas.append(f"• **#{pid}** — {nome[:80]} — _{dh or 'sem data'}_")
-        texto = "\n".join(linhas)
-        if len(texto) > 3800:
-            texto = texto[:3797] + "..."
-        embed = discord.Embed(
-            title="📋 Produtos no banco",
-            description=texto,
-            color=discord.Color.dark_grey(),
-        )
-        embed.set_footer(text=f"Total: {len(produtos)} • até 25 no menu público")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-def build_painel_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="📦 REPOSITÓRIO DE ARQUIVOS",
-        description="Selecione um item no menu para receber o arquivo em sua DM.",
-        color=discord.Color.dark_grey(),
-    )
-    embed.set_footer(
-        text="⚠️ Certifique-se de que suas mensagens privadas (DMs) estão abertas para receber os conteúdos."
-    )
-    return embed
-
-
+# =============================================================================
+#  BOT
+# =============================================================================
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
-_view_registered = False
 
 
 @bot.event
 async def setup_hook() -> None:
-    init_database()
+    """Executado antes do login — inicializa DB e sincroniza slash commands."""
+    init_db()
     await bot.tree.sync()
 
 
 @bot.event
 async def on_ready() -> None:
-    global _view_registered
-    if not _view_registered:
-        bot.add_view(PersistentDropdownView())
-        _view_registered = True
-    print(f"✅ Bot conectado como {bot.user} (ID: {bot.user.id})")
-    print("✅ Comandos slash sincronizados.")
+    """Registra a PainelView como persistente logo na inicialização."""
+    bot.add_view(PainelView())
+    print(f"✅ Bot online como {bot.user}  (ID: {bot.user.id})")
+    print("✅ Slash commands sincronizados.")
+    print("✅ Persistent View registrada.")
 
 
-@bot.tree.command(name="admin", description="Painel exclusivo do administrador")
-async def admin_panel(interaction: discord.Interaction) -> None:
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message(
-            "❌ Acesso negado. Comando restrito ao administrador.",
-            ephemeral=True,
-        )
+# ---------------------------------------------------------------------------
+#  /gerenciar  —  painel administrativo (somente OWNER_ID)
+# ---------------------------------------------------------------------------
+@bot.tree.command(name="gerenciar", description="Painel exclusivo do administrador")
+async def cmd_gerenciar(interaction: discord.Interaction) -> None:
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
         return
+
+    arquivos = db_all()
+    linhas = "\n".join(
+        f"• **#{pid}** — {nome[:60]} — _{dh}_"
+        for pid, nome, _, dh in arquivos
+    ) or "_Nenhum arquivo cadastrado._"
+
+    if len(linhas) > 3800:
+        linhas = linhas[:3797] + "..."
 
     embed = discord.Embed(
-        title="⚙️ Painel de Controle Admin",
-        description=(
-            "**Cadastrar** — novo produto no banco.\n"
-            "**Editar** — escolha no menu e altere nome/conteúdo.\n"
-            "**Excluir** — remove do banco (ação imediata).\n"
-            "**Listar** — vê todos os IDs e datas.\n\n"
-            "_Após alterações, use `/enviar_painel` no canal público para atualizar o menu fixo._"
-        ),
-        color=discord.Color.dark_grey(),
+        title="⚙️  Painel de Controle",
+        color=DARK,
     )
-    embed.set_footer(text="DOUGOBRASIL • Enterprise Control")
-    await interaction.response.send_message(
-        embed=embed,
-        view=AdminControlView(),
-        ephemeral=True,
+    embed.add_field(
+        name="📋 Arquivos no banco",
+        value=linhas,
+        inline=False,
     )
+    embed.add_field(
+        name="➕ Cadastrar novo arquivo",
+        value="Clique no botão abaixo para abrir o formulário.",
+        inline=False,
+    )
+    embed.set_footer(text=f"Total: {len(arquivos)} arquivo(s)")
+
+    view = discord.ui.View(timeout=300)
+
+    async def _abrir_modal(inter: discord.Interaction) -> None:
+        await inter.response.send_modal(CadastrarArquivoModal())
+
+    btn = discord.ui.Button(
+        label="➕ Cadastrar Arquivo",
+        style=discord.ButtonStyle.primary,
+        custom_id="admin_cadastrar_btn",
+    )
+    btn.callback = _abrir_modal
+    view.add_item(btn)
+
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="enviar_painel", description="Envia e fixa o painel de resgate no canal atual")
-async def enviar_painel(interaction: discord.Interaction) -> None:
-    if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message(
-            "❌ Acesso negado. Comando restrito ao administrador.",
-            ephemeral=True,
-        )
+# ---------------------------------------------------------------------------
+#  /enviar_painel  —  publica e fixa o painel público
+# ---------------------------------------------------------------------------
+@bot.tree.command(name="enviar_painel", description="Envia e fixa o painel de arquivos no canal atual")
+async def cmd_enviar_painel(interaction: discord.Interaction) -> None:
+    if not _is_owner(interaction.user.id):
+        await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
         return
 
-    target_channel = interaction.channel
-    if target_channel is None:
+    canal = interaction.channel
+    if not isinstance(canal, (discord.TextChannel, discord.Thread)):
         await interaction.response.send_message(
-            "❌ Não foi possível identificar o canal para publicar o painel.",
-            ephemeral=True,
-        )
-        return
-
-    if not isinstance(target_channel, (discord.TextChannel, discord.Thread)):
-        await interaction.response.send_message(
-            "❌ Selecione um canal de texto (ou thread) para publicar o painel.",
-            ephemeral=True,
+            "❌ Use este comando em um canal de texto.", ephemeral=True
         )
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
 
+    embed = discord.Embed(
+        title="📦  Repositório de Arquivos",
+        description=(
+            "Selecione um item no menu abaixo para receber o arquivo **diretamente na sua DM**.\n\n"
+            "> ⚠️ Certifique-se de que suas **Mensagens Diretas** estão abertas nas configurações de privacidade do servidor."
+        ),
+        color=DARK,
+    )
+    embed.set_footer(text="DOUGOBRASIL • Enterprise  •  Painel persistente")
+
     try:
-        panel_message = await target_channel.send(
-            embed=build_painel_embed(),
-            view=PersistentDropdownView(),
-        )
+        msg = await canal.send(embed=embed, view=PainelView())
     except discord.Forbidden:
         await interaction.followup.send(
-            "❌ Não consigo **enviar mensagens** neste canal. "
-            "Confira se o bot está no servidor e se tem permissão **Enviar mensagens** e **Incorporar links** "
-            "(e nas permissões do canal, se algo estiver bloqueado para o cargo do bot).",
-            ephemeral=True,
+            "❌ Sem permissão para enviar mensagens neste canal.", ephemeral=True
         )
         return
     except discord.HTTPException:
         await interaction.followup.send(
-            "❌ Falha ao publicar o painel. Tente novamente.",
-            ephemeral=True,
+            "❌ Falha ao publicar o painel. Tente novamente.", ephemeral=True
         )
         return
 
-    pin_ok = False
+    # Tenta fixar — falha silenciosamente se não tiver permissão
+    pinned = False
     try:
-        await panel_message.pin(reason="Painel fixo do repositório de arquivos")
-        pin_ok = True
-    except discord.Forbidden:
-        pass
-    except discord.HTTPException:
+        await msg.pin(reason="Painel fixo do repositório de arquivos")
+        pinned = True
+    except (discord.Forbidden, discord.HTTPException):
         pass
 
-    if pin_ok:
-        await interaction.followup.send(
-            f"✅ Painel enviado e fixado em {target_channel.mention}.",
-            ephemeral=True,
-        )
-    else:
-        await interaction.followup.send(
-            f"✅ Painel enviado em {target_channel.mention}.\n"
-            "⚠️ Não consegui **fixar** a mensagem: o bot precisa da permissão **Gerenciar mensagens** "
-            "neste canal (ou fixe manualmente).",
-            ephemeral=True,
-        )
+    status = "e fixado" if pinned else "(pin falhou — conceda **Gerenciar mensagens** ao bot)"
+    await interaction.followup.send(
+        f"✅ Painel enviado {status} em {canal.mention}.", ephemeral=True
+    )
 
 
+# =============================================================================
+#  ENTRY POINT
+# =============================================================================
 def main() -> None:
-    # Inicia o Flask em uma thread daemon para não bloquear o bot
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print("🌐 Servidor Flask iniciado na porta 8080.")
+    # Inicia o Flask numa thread daemon antes do event loop do Discord
+    t = threading.Thread(target=_run_flask, daemon=True, name="flask-uptime")
+    t.start()
+    print("🌐 Flask iniciado na porta 10000.")
 
     bot.run(DISCORD_TOKEN)
 
