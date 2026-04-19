@@ -712,7 +712,7 @@ async def cmd_gerenciar(interaction: discord.Interaction) -> None:
         ),
         inline=False,
     )
-    embed.set_footer(text="DOUGOBRASIL • Enterprise  •  Firebase Firestore")
+    embed.set_footer(text="DOUGOBRASIL • Enterprise  •  Sistema de Gestão v1.0")
     await interaction.followup.send(embed=embed, view=AdminPainelView(), ephemeral=True)
 
 
@@ -756,16 +756,70 @@ async def cmd_enviar_painel(interaction: discord.Interaction) -> None:
         ]
     view.add_item(select)
 
+    # ── Ícone do servidor (adorna o footer) ───────────────────────────────────
+    guild_icon = interaction.guild.icon.url if (interaction.guild and interaction.guild.icon) else None
+
+    # ── Embed premium ──────────────────────────────────────────────────────────
     embed = discord.Embed(
-        title="📦  Repositório de Arquivos",
+        title="⚡  DOUGOBRASIL OFICIAL  —  Repositório",
         description=(
-            "Selecione um item no menu abaixo para receber o arquivo **diretamente na sua DM**.\n\n"
-            "> ⚠️ Certifique-se de que suas **Mensagens Diretas** estão abertas "
-            "nas configurações de privacidade do servidor."
+            "```\n"
+            "  Bem-vindo ao sistema de distribuição exclusiva.\n"
+            "  Selecione um arquivo abaixo e receba na sua DM.\n"
+            "```"
         ),
-        color=DARK,
+        color=0x9D4EDD,   # Roxo royal — identidade DougoBrasil
     )
-    embed.set_footer(text="DOUGOBRASIL • Enterprise  •  Powered by Firebase")
+
+    # Campo: como funciona
+    embed.add_field(
+        name="📋  Como funciona",
+        value=(
+            "`①` Escolha um arquivo no **menu abaixo**\n"
+            "`②` Tenha suas **DMs abertas** no servidor\n"
+            "`③` Receba o arquivo **instantaneamente**"
+        ),
+        inline=False,
+    )
+
+    # Separador visual
+    embed.add_field(name="\u200b", value="─────────────────────────────────", inline=False)
+
+    # Campos de status — inline para layout compacto
+    embed.add_field(
+        name="🗂️  Catálogo",
+        value=f"` {len(arquivos)} ` arquivo(s)",
+        inline=True,
+    )
+    embed.add_field(
+        name="🔒  Acesso",
+        value="`Membros do servidor`",
+        inline=True,
+    )
+    embed.add_field(
+        name="📡  Status",
+        value="`🟢 Online`",
+        inline=True,
+    )
+
+    # Separador visual
+    embed.add_field(name="\u200b", value="─────────────────────────────────", inline=False)
+
+    # Aviso DM
+    embed.add_field(
+        name="⚠️  Atenção",
+        value=(
+            "Para receber os arquivos ative as **Mensagens Diretas** "
+            "nas configurações de privacidade deste servidor.\n"
+            "> `Configurações do servidor  →  Privacidade  →  ✅ Mensagens Diretas`"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=f"DOUGOBRASIL • Enterprise  •  Distribuição Segura de Arquivos  •  {_agora_br()}",
+        icon_url=guild_icon,
+    )
 
     try:
         msg = await canal.send(embed=embed, view=view)
