@@ -1,8 +1,11 @@
 # =============================================================================
 #  main.py  —  Discord Bot + Firebase Firestore + Flask uptime (Render-ready)
 #  Painel Admin completo: Cadastrar / Editar / Apagar + Gestão de Admins
+#  CORREÇÃO: todas as chamadas Firestore são feitas via asyncio.to_thread()
+#            para não bloquear o event loop do Discord.
 # =============================================================================
 
+import asyncio
 import io
 import json
 import logging
@@ -21,7 +24,7 @@ from flask import Flask
 #  CONFIGURAÇÃO  —  variáveis de ambiente
 # =============================================================================
 DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
-OWNER_ID: int = int(os.getenv("OWNER_ID", "0"))
+OWNER_ID: int      = int(os.getenv("OWNER_ID", "0"))
 FIREBASE_JSON: str = os.getenv("FIREBASE_JSON", "")
 
 if not DISCORD_TOKEN:
@@ -31,10 +34,10 @@ if not OWNER_ID:
 if not FIREBASE_JSON:
     raise RuntimeError("Variável de ambiente FIREBASE_JSON não definida.")
 
-TZ_BR   = pytz.timezone("America/Sao_Paulo")
-DARK    = 0x2B2D31       # cor dark-mode
-COLECAO         = "scripts_dougo"
-COLECAO_ADMINS  = "admins_dougo"
+TZ_BR          = pytz.timezone("America/Sao_Paulo")
+DARK           = 0x2B2D31
+COLECAO        = "scripts_dougo"
+COLECAO_ADMINS = "admins_dougo"
 
 
 # =============================================================================
@@ -52,7 +55,7 @@ _col, _col_admins = _init_firebase()
 
 
 # =============================================================================
-#  HELPERS  —  data/hora e nome de arquivo seguro
+#  HELPERS
 # =============================================================================
 def _agora_br() -> str:
     return datetime.now(TZ_BR).strftime("%d/%m/%Y às %H:%M")
@@ -64,13 +67,17 @@ def _safe_filename(name: str) -> str:
 
 
 # =============================================================================
-#  CAMADA DE DADOS  —  scripts_dougo
+#  CAMADA DE DADOS SÍNCRONA  —  chamadas puras ao Firestore
+#  ⚠️  NUNCA chame estas funções diretamente em callbacks async.
+#     Use sempre: await asyncio.to_thread(funcao, args...)
 # =============================================================================
-def db_insert(nome: str, conteudo: str) -> None:
+
+# ── scripts_dougo ─────────────────────────────────────────────────────────────
+def _db_insert(nome: str, conteudo: str) -> None:
     _col.add({"nome": nome, "conteudo": conteudo, "data_criacao": _agora_br()})
 
 
-def db_all() -> list[dict]:
+def _db_all() -> list[dict]:
     docs = _col.order_by("data_criacao", direction=firestore.Query.DESCENDING).stream()
     result = []
     for doc in docs:
@@ -80,7 +87,7 @@ def db_all() -> list[dict]:
     return result
 
 
-def db_get(doc_id: str) -> dict | None:
+def _db_get(doc_id: str) -> dict | None:
     snap = _col.document(doc_id).get()
     if not snap.exists:
         return None
@@ -89,7 +96,7 @@ def db_get(doc_id: str) -> dict | None:
     return d
 
 
-def db_update(doc_id: str, nome: str, conteudo: str) -> bool:
+def _db_update(doc_id: str, nome: str, conteudo: str) -> bool:
     snap = _col.document(doc_id).get()
     if not snap.exists:
         return False
@@ -101,7 +108,7 @@ def db_update(doc_id: str, nome: str, conteudo: str) -> bool:
     return True
 
 
-def db_delete(doc_id: str) -> bool:
+def _db_delete(doc_id: str) -> bool:
     snap = _col.document(doc_id).get()
     if not snap.exists:
         return False
@@ -109,10 +116,13 @@ def db_delete(doc_id: str) -> bool:
     return True
 
 
-# =============================================================================
-#  CAMADA DE DADOS  —  admins_dougo
-# =============================================================================
-def admin_add(user_id: int, adicionado_por: int) -> None:
+# ── admins_dougo ──────────────────────────────────────────────────────────────
+def _admin_check(user_id: int) -> bool:
+    """Verifica se o user_id existe na coleção de admins (síncrono)."""
+    return _col_admins.document(str(user_id)).get().exists
+
+
+def _admin_add(user_id: int, adicionado_por: int) -> None:
     _col_admins.document(str(user_id)).set({
         "user_id": user_id,
         "adicionado_por": adicionado_por,
@@ -120,7 +130,7 @@ def admin_add(user_id: int, adicionado_por: int) -> None:
     })
 
 
-def admin_remove(user_id: int) -> bool:
+def _admin_remove(user_id: int) -> bool:
     snap = _col_admins.document(str(user_id)).get()
     if not snap.exists:
         return False
@@ -128,15 +138,50 @@ def admin_remove(user_id: int) -> bool:
     return True
 
 
-def admin_all() -> list[dict]:
+def _admin_all() -> list[dict]:
     return [doc.to_dict() for doc in _col_admins.stream()]
 
 
-def _is_admin(user_id: int) -> bool:
-    """OWNER_ID é sempre superadmin; outros são verificados no Firestore."""
+# =============================================================================
+#  WRAPPERS ASSÍNCRONOS  —  use estes nas corrotinas do Discord
+# =============================================================================
+async def is_admin(user_id: int) -> bool:
+    """OWNER_ID é sempre superadmin; outros verificados no Firestore em thread."""
     if user_id == OWNER_ID:
         return True
-    return _col_admins.document(str(user_id)).get().exists
+    return await asyncio.to_thread(_admin_check, user_id)
+
+
+async def db_all() -> list[dict]:
+    return await asyncio.to_thread(_db_all)
+
+
+async def db_get(doc_id: str) -> dict | None:
+    return await asyncio.to_thread(_db_get, doc_id)
+
+
+async def db_insert(nome: str, conteudo: str) -> None:
+    await asyncio.to_thread(_db_insert, nome, conteudo)
+
+
+async def db_update(doc_id: str, nome: str, conteudo: str) -> bool:
+    return await asyncio.to_thread(_db_update, doc_id, nome, conteudo)
+
+
+async def db_delete(doc_id: str) -> bool:
+    return await asyncio.to_thread(_db_delete, doc_id)
+
+
+async def admin_all() -> list[dict]:
+    return await asyncio.to_thread(_admin_all)
+
+
+async def admin_add(user_id: int, adicionado_por: int) -> None:
+    await asyncio.to_thread(_admin_add, user_id, adicionado_por)
+
+
+async def admin_remove(user_id: int) -> bool:
+    return await asyncio.to_thread(_admin_remove, user_id)
 
 
 # =============================================================================
@@ -159,12 +204,9 @@ def _run_flask() -> None:
 #  ─── MODAIS ─────────────────────────────────────────────────────────────────
 # =============================================================================
 
-# ── Cadastrar ────────────────────────────────────────────────────────────────
 class CadastrarArquivoModal(discord.ui.Modal, title="➕ Cadastrar Arquivo"):
     nome = discord.ui.TextInput(
-        label="Nome do Arquivo",
-        placeholder="Ex: Hack Premium v3",
-        max_length=100,
+        label="Nome do Arquivo", placeholder="Ex: Hack Premium v3", max_length=100
     )
     conteudo = discord.ui.TextInput(
         label="Código / Conteúdo",
@@ -174,10 +216,11 @@ class CadastrarArquivoModal(discord.ui.Modal, title="➕ Cadastrar Arquivo"):
     )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not _is_admin(interaction.user.id):
+        if not await is_admin(interaction.user.id):
             await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
             return
-        db_insert(str(self.nome), str(self.conteudo))
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await db_insert(str(self.nome), str(self.conteudo))
         embed = discord.Embed(
             title="✅ Arquivo Salvo no Firebase",
             description=(
@@ -187,22 +230,18 @@ class CadastrarArquivoModal(discord.ui.Modal, title="➕ Cadastrar Arquivo"):
             ),
             color=DARK,
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         await interaction.response.send_message(f"❌ Erro: `{error}`", ephemeral=True)
 
 
-# ── Editar (pré-preenchido) ───────────────────────────────────────────────────
 class EditarArquivoModal(discord.ui.Modal):
     def __init__(self, doc_id: str, nome_atual: str, conteudo_atual: str) -> None:
         super().__init__(title="✏️ Editar Arquivo")
         self.doc_id = doc_id
-
         self.nome = discord.ui.TextInput(
-            label="Nome do Arquivo",
-            default=nome_atual[:100],
-            max_length=100,
+            label="Nome do Arquivo", default=nome_atual[:100], max_length=100
         )
         self.conteudo = discord.ui.TextInput(
             label="Código / Conteúdo",
@@ -214,22 +253,20 @@ class EditarArquivoModal(discord.ui.Modal):
         self.add_item(self.conteudo)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not _is_admin(interaction.user.id):
+        if not await is_admin(interaction.user.id):
             await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
             return
-        ok = db_update(self.doc_id, str(self.nome), str(self.conteudo))
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok = await db_update(self.doc_id, str(self.nome), str(self.conteudo))
         if ok:
             embed = discord.Embed(
                 title="✅ Arquivo Atualizado",
-                description=(
-                    f"**Nome:** `{self.nome}`\n"
-                    f"**Atualizado em:** {_agora_br()}"
-                ),
+                description=f"**Nome:** `{self.nome}`\n**Atualizado em:** {_agora_br()}",
                 color=DARK,
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
         else:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Arquivo não encontrado (pode ter sido removido).", ephemeral=True
             )
 
@@ -237,7 +274,6 @@ class EditarArquivoModal(discord.ui.Modal):
         await interaction.response.send_message(f"❌ Erro: `{error}`", ephemeral=True)
 
 
-# ── Adicionar Admin ───────────────────────────────────────────────────────────
 class AdicionarAdminModal(discord.ui.Modal, title="👥 Adicionar Administrador"):
     user_id_input = discord.ui.TextInput(
         label="ID do Usuário Discord",
@@ -248,38 +284,43 @@ class AdicionarAdminModal(discord.ui.Modal, title="👥 Adicionar Administrador"
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("❌ Apenas o dono pode adicionar admins.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Apenas o dono pode adicionar admins.", ephemeral=True
+            )
             return
         try:
             novo_id = int(str(self.user_id_input).strip())
         except ValueError:
-            await interaction.response.send_message("❌ ID inválido. Insira apenas números.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ ID inválido. Insira apenas números.", ephemeral=True
+            )
             return
-
         if novo_id == OWNER_ID:
-            await interaction.response.send_message("ℹ️ Este ID já é o dono do bot.", ephemeral=True)
+            await interaction.response.send_message(
+                "ℹ️ Este ID já é o dono do bot.", ephemeral=True
+            )
             return
-
-        admin_add(novo_id, interaction.user.id)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await admin_add(novo_id, interaction.user.id)
         embed = discord.Embed(
             title="✅ Admin Adicionado",
-            description=f"**ID:** `{novo_id}` agora tem acesso ao painel admin.\n**Em:** {_agora_br()}",
+            description=f"**ID:** `{novo_id}` agora tem acesso ao painel.\n**Em:** {_agora_br()}",
             color=DARK,
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         await interaction.response.send_message(f"❌ Erro: `{error}`", ephemeral=True)
 
 
 # =============================================================================
-#  ─── SELECTS ADMINISTRATIVOS ─────────────────────────────────────────────────
+#  ─── SELECTS ADMINISTRATIVOS  (recebem dados já buscados — sem I/O no __init__)
 # =============================================================================
 
-# ── Select: escolher arquivo para EDITAR ─────────────────────────────────────
 class EditarArquivoSelect(discord.ui.Select):
-    def __init__(self) -> None:
-        arquivos = db_all()
+    """Construído com a lista já carregada assincronamente pelo botão pai."""
+
+    def __init__(self, arquivos: list[dict]) -> None:
         options = [
             discord.SelectOption(
                 label=arq["nome"][:100],
@@ -287,22 +328,20 @@ class EditarArquivoSelect(discord.ui.Select):
                 value=arq["doc_id"],
             )
             for arq in arquivos[:25]
-        ] or [
-            discord.SelectOption(label="Nenhum arquivo cadastrado", value="none")
-        ]
+        ] or [discord.SelectOption(label="Nenhum arquivo cadastrado", value="none")]
         super().__init__(
             placeholder="✏️  Selecione o arquivo para editar...",
             min_values=1, max_values=1, options=options,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if not _is_admin(interaction.user.id):
+        if not await is_admin(interaction.user.id):
             await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
             return
         if self.values[0] == "none":
             await interaction.response.send_message("ℹ️ Nenhum arquivo para editar.", ephemeral=True)
             return
-        arq = db_get(self.values[0])
+        arq = await db_get(self.values[0])
         if not arq:
             await interaction.response.send_message("❌ Arquivo não encontrado.", ephemeral=True)
             return
@@ -311,10 +350,8 @@ class EditarArquivoSelect(discord.ui.Select):
         )
 
 
-# ── Select: escolher arquivo para APAGAR ─────────────────────────────────────
 class ApagarArquivoSelect(discord.ui.Select):
-    def __init__(self) -> None:
-        arquivos = db_all()
+    def __init__(self, arquivos: list[dict]) -> None:
         options = [
             discord.SelectOption(
                 label=arq["nome"][:100],
@@ -322,39 +359,33 @@ class ApagarArquivoSelect(discord.ui.Select):
                 value=arq["doc_id"],
             )
             for arq in arquivos[:25]
-        ] or [
-            discord.SelectOption(label="Nenhum arquivo cadastrado", value="none")
-        ]
+        ] or [discord.SelectOption(label="Nenhum arquivo cadastrado", value="none")]
         super().__init__(
             placeholder="🗑️  Selecione o arquivo para apagar...",
             min_values=1, max_values=1, options=options,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if not _is_admin(interaction.user.id):
+        if not await is_admin(interaction.user.id):
             await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
             return
         if self.values[0] == "none":
             await interaction.response.send_message("ℹ️ Nenhum arquivo para apagar.", ephemeral=True)
             return
-        arq = db_get(self.values[0])
+        arq = await db_get(self.values[0])
         if not arq:
             await interaction.response.send_message("❌ Arquivo não encontrado.", ephemeral=True)
             return
-        # Pede confirmação antes de apagar
         view = ConfirmarApagarView(arq["doc_id"], arq["nome"])
         await interaction.response.send_message(
-            f"⚠️ Tem certeza que deseja apagar **{arq['nome'][:80]}**?\n"
-            "**Esta ação é irreversível.**",
+            f"⚠️ Tem certeza que deseja apagar **{arq['nome'][:80]}**?\n**Esta ação é irreversível.**",
             view=view,
             ephemeral=True,
         )
 
 
-# ── Select: remover admin ─────────────────────────────────────────────────────
 class RemoverAdminSelect(discord.ui.Select):
-    def __init__(self) -> None:
-        admins = admin_all()
+    def __init__(self, admins: list[dict]) -> None:
         options = [
             discord.SelectOption(
                 label=f"ID: {a['user_id']}",
@@ -362,9 +393,7 @@ class RemoverAdminSelect(discord.ui.Select):
                 value=str(a["user_id"]),
             )
             for a in admins[:25]
-        ] or [
-            discord.SelectOption(label="Nenhum admin cadastrado", value="none")
-        ]
+        ] or [discord.SelectOption(label="Nenhum admin cadastrado", value="none")]
         super().__init__(
             placeholder="🗑️  Selecione o admin para remover...",
             min_values=1, max_values=1, options=options,
@@ -372,26 +401,27 @@ class RemoverAdminSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("❌ Apenas o dono pode remover admins.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Apenas o dono pode remover admins.", ephemeral=True
+            )
             return
         if self.values[0] == "none":
             await interaction.response.send_message("ℹ️ Nenhum admin para remover.", ephemeral=True)
             return
-        uid = int(self.values[0])
-        ok = admin_remove(uid)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok = await admin_remove(int(self.values[0]))
         if ok:
-            await interaction.response.send_message(
-                f"✅ ID `{uid}` removido dos administradores.", ephemeral=True
+            await interaction.followup.send(
+                f"✅ ID `{self.values[0]}` removido dos administradores.", ephemeral=True
             )
         else:
-            await interaction.response.send_message("❌ Admin não encontrado.", ephemeral=True)
+            await interaction.followup.send("❌ Admin não encontrado.", ephemeral=True)
 
 
 # =============================================================================
 #  ─── VIEWS AUXILIARES ────────────────────────────────────────────────────────
 # =============================================================================
 
-# ── Confirmação de exclusão ───────────────────────────────────────────────────
 class ConfirmarApagarView(discord.ui.View):
     def __init__(self, doc_id: str, nome: str) -> None:
         super().__init__(timeout=60)
@@ -400,22 +430,22 @@ class ConfirmarApagarView(discord.ui.View):
 
     @discord.ui.button(label="✅ Confirmar Exclusão", style=discord.ButtonStyle.danger)
     async def confirmar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if not _is_admin(interaction.user.id):
+        if not await is_admin(interaction.user.id):
             await interaction.response.edit_message(content="❌ Acesso negado.", view=None)
             return
-        ok = db_delete(self.doc_id)
+        await interaction.response.defer()
+        ok = await db_delete(self.doc_id)
         msg = (
             f"✅ Arquivo **{self.nome[:80]}** apagado com sucesso."
             if ok else "❌ Arquivo não encontrado (já removido?)."
         )
-        await interaction.response.edit_message(content=msg, view=None)
+        await interaction.edit_original_response(content=msg, view=None)
 
     @discord.ui.button(label="❌ Cancelar", style=discord.ButtonStyle.secondary)
     async def cancelar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(content="🚫 Exclusão cancelada.", view=None)
 
 
-# ── Painel de gestão de admins ────────────────────────────────────────────────
 class GerenciarAdminsView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=300)
@@ -423,39 +453,41 @@ class GerenciarAdminsView(discord.ui.View):
     @discord.ui.button(label="➕ Adicionar Admin", style=discord.ButtonStyle.primary, row=0)
     async def adicionar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("❌ Apenas o dono pode adicionar admins.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Apenas o dono pode adicionar admins.", ephemeral=True
+            )
             return
         await interaction.response.send_modal(AdicionarAdminModal())
 
     @discord.ui.button(label="🗑️ Remover Admin", style=discord.ButtonStyle.danger, row=0)
     async def remover(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("❌ Apenas o dono pode remover admins.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Apenas o dono pode remover admins.", ephemeral=True
+            )
             return
-        admins = admin_all()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        admins = await admin_all()
         if not admins:
-            await interaction.response.send_message("ℹ️ Nenhum admin cadastrado.", ephemeral=True)
+            await interaction.followup.send("ℹ️ Nenhum admin cadastrado.", ephemeral=True)
             return
         view = discord.ui.View(timeout=120)
-        view.add_item(RemoverAdminSelect())
-        await interaction.response.send_message(view=view, ephemeral=True)
+        view.add_item(RemoverAdminSelect(admins))
+        await interaction.followup.send(view=view, ephemeral=True)
 
 
 # =============================================================================
 #  ─── PAINEL ADMIN PRINCIPAL ──────────────────────────────────────────────────
 # =============================================================================
 class AdminPainelView(discord.ui.View):
-    """View principal do painel administrativo — expira em 10 min."""
-
     def __init__(self) -> None:
         super().__init__(timeout=600)
 
     # ── Row 0 ──────────────────────────────────────────────────────────────────
-
     @discord.ui.button(label="➕ Cadastrar", style=discord.ButtonStyle.success,
                        custom_id="admin_cadastrar", row=0)
     async def cadastrar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if not _is_admin(interaction.user.id):
+        if not await is_admin(interaction.user.id):
             await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
             return
         await interaction.response.send_modal(CadastrarArquivoModal())
@@ -463,61 +495,60 @@ class AdminPainelView(discord.ui.View):
     @discord.ui.button(label="✏️ Editar", style=discord.ButtonStyle.primary,
                        custom_id="admin_editar", row=0)
     async def editar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if not _is_admin(interaction.user.id):
+        if not await is_admin(interaction.user.id):
             await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
             return
-        arquivos = db_all()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        arquivos = await db_all()
         if not arquivos:
-            await interaction.response.send_message("ℹ️ Nenhum arquivo cadastrado para editar.", ephemeral=True)
+            await interaction.followup.send("ℹ️ Nenhum arquivo cadastrado para editar.", ephemeral=True)
             return
         view = discord.ui.View(timeout=120)
-        view.add_item(EditarArquivoSelect())
-        await interaction.response.send_message(
+        view.add_item(EditarArquivoSelect(arquivos))
+        await interaction.followup.send(
             "Selecione o arquivo que deseja **editar**:", view=view, ephemeral=True
         )
 
     @discord.ui.button(label="🗑️ Apagar", style=discord.ButtonStyle.danger,
                        custom_id="admin_apagar", row=0)
     async def apagar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if not _is_admin(interaction.user.id):
+        if not await is_admin(interaction.user.id):
             await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
             return
-        arquivos = db_all()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        arquivos = await db_all()
         if not arquivos:
-            await interaction.response.send_message("ℹ️ Nenhum arquivo cadastrado para apagar.", ephemeral=True)
+            await interaction.followup.send("ℹ️ Nenhum arquivo cadastrado para apagar.", ephemeral=True)
             return
         view = discord.ui.View(timeout=120)
-        view.add_item(ApagarArquivoSelect())
-        await interaction.response.send_message(
+        view.add_item(ApagarArquivoSelect(arquivos))
+        await interaction.followup.send(
             "Selecione o arquivo que deseja **apagar**:", view=view, ephemeral=True
         )
 
     # ── Row 1 ──────────────────────────────────────────────────────────────────
-
     @discord.ui.button(label="📋 Listar Arquivos", style=discord.ButtonStyle.secondary,
                        custom_id="admin_listar", row=1)
     async def listar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if not _is_admin(interaction.user.id):
+        if not await is_admin(interaction.user.id):
             await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
             return
-        arquivos = db_all()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        arquivos = await db_all()
         if not arquivos:
-            await interaction.response.send_message("ℹ️ Nenhum arquivo cadastrado.", ephemeral=True)
+            await interaction.followup.send("ℹ️ Nenhum arquivo cadastrado.", ephemeral=True)
             return
-
         linhas = []
         for arq in arquivos:
             atualizado = arq.get("data_atualizacao")
             data_label = f"✏️ {atualizado}" if atualizado else f"📅 {arq.get('data_criacao', '—')}"
             linhas.append(f"• **{arq['nome'][:55]}**\n  └ `{arq['doc_id'][:12]}…`  {data_label}")
-
         texto = "\n".join(linhas)
         if len(texto) > 3800:
             texto = texto[:3797] + "..."
-
         embed = discord.Embed(title="📋 Arquivos — scripts_dougo", description=texto, color=DARK)
         embed.set_footer(text=f"Total: {len(arquivos)} arquivo(s)")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="👥 Gerenciar Admins", style=discord.ButtonStyle.secondary,
                        custom_id="admin_admins", row=1)
@@ -527,63 +558,72 @@ class AdminPainelView(discord.ui.View):
                 "❌ Apenas o **dono** do bot pode gerenciar administradores.", ephemeral=True
             )
             return
-
-        admins = admin_all()
-        if admins:
-            linhas = "\n".join(
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        admins = await admin_all()
+        linhas = (
+            "\n".join(
                 f"• `{a['user_id']}` — adicionado em _{a.get('data', '—')}_"
                 for a in admins
             )
-        else:
-            linhas = "_Nenhum admin extra cadastrado. Apenas você (OWNER) tem acesso._"
-
+            or "_Nenhum admin extra. Apenas você (OWNER) tem acesso._"
+        )
         embed = discord.Embed(title="👥 Administradores do Painel", color=DARK)
         embed.add_field(name="IDs com acesso ao /gerenciar", value=linhas[:1024], inline=False)
         embed.set_footer(text=f"Total: {len(admins)} admin(s) extra(s)  •  OWNER não listado")
-
-        await interaction.response.send_message(
-            embed=embed, view=GerenciarAdminsView(), ephemeral=True
-        )
+        await interaction.followup.send(embed=embed, view=GerenciarAdminsView(), ephemeral=True)
 
 
 # =============================================================================
 #  ─── SELECT PERSISTENTE — painel público ────────────────────────────────────
 # =============================================================================
 class ArquivoSelect(discord.ui.Select):
+    """
+    Em Persistent Views o __init__ é chamado com options vazias no on_ready.
+    O callback busca os dados em tempo real no Firestore via asyncio.to_thread.
+    """
+
     def __init__(self) -> None:
-        arquivos = db_all()
-        options: list[discord.SelectOption] = [
-            discord.SelectOption(
-                label=arq["nome"][:100],
-                description=f"Cadastrado em: {arq.get('data_criacao', '—')}"[:100],
-                value=arq["doc_id"],
-            )
-            for arq in arquivos[:25]
-        ] or [
-            discord.SelectOption(
-                label="Nenhum arquivo disponível",
-                description="Aguarde o administrador cadastrar conteúdos.",
-                value="none",
-            )
-        ]
+        # Placeholder option — as opções reais são buscadas no callback
         super().__init__(
             custom_id="persistent_arquivo_select",
             placeholder="📂  Escolha o arquivo para receber na DM...",
-            min_values=1, max_values=1, options=options,
+            min_values=1,
+            max_values=1,
+            options=[discord.SelectOption(label="Carregando...", value="loading")],
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if self.values[0] == "none":
-            await interaction.response.send_message("ℹ️ Nenhum arquivo cadastrado ainda.", ephemeral=True)
-            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
-        arq = db_get(self.values[0])
-        if not arq:
-            await interaction.response.send_message(
-                "❌ Arquivo não encontrado (pode ter sido removido).", ephemeral=True
+        # Busca os dados em tempo real (sem bloquear o event loop)
+        arquivos = await db_all()
+
+        # Se o usuário selecionou "loading" (painel antigo sem opções reais)
+        # ou não há arquivos, informa e sai
+        if not arquivos:
+            await interaction.followup.send(
+                "ℹ️ Nenhum arquivo disponível no momento.", ephemeral=True
             )
             return
 
+        # Reconstrói o mapa doc_id → arquivo para lookup rápido
+        mapa = {arq["doc_id"]: arq for arq in arquivos}
+        valor = self.values[0]
+
+        if valor == "loading" or valor not in mapa:
+            # O painel estava com options antigas — manda lista atualizada
+            opcoes_texto = "\n".join(
+                f"• **{arq['nome'][:60]}**" for arq in arquivos[:15]
+            )
+            await interaction.followup.send(
+                "⚠️ O painel precisa ser **atualizado**.\n"
+                "Peça ao admin para usar /enviar_painel novamente.\n\n"
+                f"**Arquivos disponíveis:**\n{opcoes_texto}",
+                ephemeral=True,
+            )
+            return
+
+        arq = mapa[valor]
         buf = io.BytesIO(arq["conteudo"].encode("utf-8"))
         arquivo = discord.File(buf, filename=f"{_safe_filename(arq['nome'])}.txt")
 
@@ -593,29 +633,31 @@ class ArquivoSelect(discord.ui.Select):
                 file=arquivo,
             )
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Não consigo te enviar o arquivo via DM.\n"
                 "Ative **Mensagens Diretas** nas configurações de privacidade do servidor.",
                 ephemeral=True,
             )
             return
         except discord.HTTPException:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Falha ao enviar o arquivo. Tente novamente em instantes.", ephemeral=True
             )
             return
 
-        await interaction.response.send_message("✅ Arquivo enviado na sua DM com segurança!", ephemeral=True)
+        await interaction.followup.send("✅ Arquivo enviado na sua DM com segurança!", ephemeral=True)
 
 
 class PainelView(discord.ui.View):
+    """Persistent View — registrada no on_ready com timeout=None."""
+
     def __init__(self) -> None:
         super().__init__(timeout=None)
         self.add_item(ArquivoSelect())
 
 
 # =============================================================================
-#  BOT
+#  ─── BOT ─────────────────────────────────────────────────────────────────────
 # =============================================================================
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -631,23 +673,23 @@ async def on_ready() -> None:
     bot.add_view(PainelView())
     print(f"✅ Bot online como {bot.user}  (ID: {bot.user.id})")
     print("✅ Slash commands sincronizados.")
-    print("✅ Persistent View (painel público) registrada.")
-    print(f"🔥 Firestore conectado — coleções: '{COLECAO}' / '{COLECAO_ADMINS}'")
+    print("✅ Persistent View registrada.")
+    print(f"🔥 Firestore — coleções: '{COLECAO}' / '{COLECAO_ADMINS}'")
 
 
 # ---------------------------------------------------------------------------
-#  /gerenciar  —  painel administrativo completo
+#  /gerenciar
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="gerenciar", description="Painel administrativo completo")
 async def cmd_gerenciar(interaction: discord.Interaction) -> None:
-    if not _is_admin(interaction.user.id):
+    if not await is_admin(interaction.user.id):
         await interaction.response.send_message(
-            "❌ Você não tem permissão para acessar o painel de administração.", ephemeral=True
+            "❌ Você não tem permissão para acessar o painel.", ephemeral=True
         )
         return
-
-    arquivos = db_all()
-    admins   = admin_all()
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    arquivos = await db_all()
+    admins   = await admin_all()
 
     embed = discord.Embed(title="⚙️  Painel de Controle", color=DARK)
     embed.add_field(
@@ -662,34 +704,57 @@ async def cmd_gerenciar(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="🛠️ Ações disponíveis",
         value=(
-            "**➕ Cadastrar** — Novo arquivo no Firebase\n"
+            "**➕ Cadastrar** — Novo arquivo\n"
             "**✏️ Editar** — Alterar nome ou conteúdo\n"
             "**🗑️ Apagar** — Remover com confirmação\n"
             "**📋 Listar** — Ver todos os arquivos\n"
-            "**👥 Admins** — Adicionar / Remover permissões _(dono)_"
+            "**👥 Admins** — Gerenciar permissões _(dono)_"
         ),
         inline=False,
     )
     embed.set_footer(text="DOUGOBRASIL • Enterprise  •  Firebase Firestore")
-
-    await interaction.response.send_message(embed=embed, view=AdminPainelView(), ephemeral=True)
+    await interaction.followup.send(embed=embed, view=AdminPainelView(), ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
-#  /enviar_painel  —  publica e fixa o painel público no canal
+#  /enviar_painel
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="enviar_painel", description="Envia e fixa o painel de arquivos no canal atual")
 async def cmd_enviar_painel(interaction: discord.Interaction) -> None:
-    if not _is_admin(interaction.user.id):
+    if not await is_admin(interaction.user.id):
         await interaction.response.send_message("❌ Acesso negado.", ephemeral=True)
         return
-
     canal = interaction.channel
     if not isinstance(canal, (discord.TextChannel, discord.Thread)):
-        await interaction.response.send_message("❌ Use este comando em um canal de texto.", ephemeral=True)
+        await interaction.response.send_message("❌ Use em um canal de texto.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # Busca arquivos para popular o Select com opções reais
+    arquivos = await db_all()
+
+    # Monta a View com opções reais do banco
+    view = discord.ui.View(timeout=None)
+    select = ArquivoSelect()
+    if arquivos:
+        select.options = [
+            discord.SelectOption(
+                label=arq["nome"][:100],
+                description=f"Cadastrado em: {arq.get('data_criacao', '—')}"[:100],
+                value=arq["doc_id"],
+            )
+            for arq in arquivos[:25]
+        ]
+    else:
+        select.options = [
+            discord.SelectOption(
+                label="Nenhum arquivo disponível",
+                description="Aguarde o administrador cadastrar conteúdos.",
+                value="loading",
+            )
+        ]
+    view.add_item(select)
 
     embed = discord.Embed(
         title="📦  Repositório de Arquivos",
@@ -703,12 +768,12 @@ async def cmd_enviar_painel(interaction: discord.Interaction) -> None:
     embed.set_footer(text="DOUGOBRASIL • Enterprise  •  Powered by Firebase")
 
     try:
-        msg = await canal.send(embed=embed, view=PainelView())
+        msg = await canal.send(embed=embed, view=view)
     except discord.Forbidden:
-        await interaction.followup.send("❌ Sem permissão para enviar mensagens neste canal.", ephemeral=True)
+        await interaction.followup.send("❌ Sem permissão neste canal.", ephemeral=True)
         return
     except discord.HTTPException:
-        await interaction.followup.send("❌ Falha ao publicar o painel.", ephemeral=True)
+        await interaction.followup.send("❌ Falha ao publicar.", ephemeral=True)
         return
 
     pinned = False
@@ -718,7 +783,7 @@ async def cmd_enviar_painel(interaction: discord.Interaction) -> None:
     except (discord.Forbidden, discord.HTTPException):
         pass
 
-    status = "e fixado" if pinned else "(pin falhou — conceda **Gerenciar mensagens** ao bot)"
+    status = "e fixado" if pinned else "(sem permissão de pin)"
     await interaction.followup.send(f"✅ Painel enviado {status} em {canal.mention}.", ephemeral=True)
 
 
